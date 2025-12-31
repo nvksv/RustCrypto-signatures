@@ -204,10 +204,10 @@ where
 
     fn decode<R: Reader<'a>>(reader: &mut R) -> der::Result<Self> {
         let header = Header::peek(reader)?;
-        header.tag.assert_eq(Tag::Sequence)?;
+        header.tag().assert_eq(Tag::Sequence)?;
 
         let mut buf = SignatureBytes::<C>::default();
-        let len = (header.encoded_len()? + header.length)?;
+        let len = (header.encoded_len()? + header.length())?;
         let slice = buf
             .get_mut(..usize::try_from(len)?)
             .ok_or_else(|| reader.error(Tag::Sequence.length_error()))?;
@@ -393,7 +393,7 @@ fn find_scalar_range(outer: &[u8], inner: &[u8]) -> Result<Range<usize>> {
     Ok(Range { start, end })
 }
 
-#[cfg(all(test, feature = "arithmetic"))]
+#[cfg(all(test, feature = "algorithm"))]
 mod tests {
     use elliptic_curve::dev::MockCurve;
 

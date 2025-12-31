@@ -1,4 +1,4 @@
-# [RustCrypto]: Ed448
+# [RustCrypto]: Ed448 signatures
 
 [![crate][crate-image]][crate-link]
 [![Docs][docs-image]][docs-link]
@@ -35,8 +35,8 @@ Ed448 implementations, including HSMs or Cloud KMS services.
 
 All crates licensed under either of
 
- * [Apache License, Version 2.0](http://www.apache.org/licenses/LICENSE-2.0)
- * [MIT license](http://opensource.org/licenses/MIT)
+ * [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+ * [MIT license](https://opensource.org/licenses/MIT)
 
 at your option.
 

@@ -6,6 +6,7 @@
 #![allow(clippy::similar_names)] // TODO: Consider resolving these
 #![allow(clippy::clone_on_copy)] // Be explicit about moving data
 #![deny(missing_docs)] // Require all public interfaces to be documented
+#![warn(unreachable_pub)] // Prevent unexpected interface changes
 
 //! # Usage
 //! This crate implements the Stateless Hash-based Digital Signature Algorithm (SLH-DSA) based on the finalized
@@ -24,7 +25,7 @@
 //! use slh_dsa::*;
 //! use signature::*;
 //!
-//! let mut rng = rand::rng();
+//! let mut rng = SysRng;
 //!
 //! // Generate a signing key using the SHAKE128f parameter set
 //! let sk = SigningKey::<Shake128f>::new(&mut rng);
@@ -62,18 +63,16 @@ mod verifying_key;
 mod wots;
 mod xmss;
 
+pub use hashes::*;
 pub use signature_encoding::*;
 pub use signing_key::*;
 pub use verifying_key::*;
 
 use fors::ForsParams;
-pub use hashes::*;
 
 /// Specific parameters for each of the 12 FIPS parameter sets
 #[allow(private_bounds)] // Intentionally un-usable type
-pub trait ParameterSet:
-    ForsParams + SigningKeyLen + VerifyingKeyLen + SignatureLen + PartialEq + Eq
-{
+pub trait ParameterSet: ForsParams + SigningKeyLen + VerifyingKeyLen + SignatureLen {
     /// Human-readable name for parameter set, matching the FIPS-205 designations
     const NAME: &'static str;
 
@@ -84,12 +83,12 @@ pub trait ParameterSet:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
+    use rand::{Rng, TryRngCore, rngs::SysRng};
     use signature::*;
     use util::macros::test_parameter_sets;
 
     fn test_sign_verify<P: ParameterSet>() {
-        let mut rng = rand::rng();
+        let mut rng = SysRng.unwrap_err();
         let sk = SigningKey::<P>::new(&mut rng);
         let vk = sk.verifying_key();
         let msg = b"Hello, world!";
@@ -101,7 +100,7 @@ mod tests {
     // Check signature fails on modified message
     #[test]
     fn test_sign_verify_shake_128f_fail_on_modified_message() {
-        let mut rng = rand::rng();
+        let mut rng = SysRng.unwrap_err();
         let sk = SigningKey::<Shake128f>::new(&mut rng);
         let msg = b"Hello, world!";
         let modified_msg = b"Goodbye, world!";
@@ -114,7 +113,7 @@ mod tests {
 
     #[test]
     fn test_sign_verify_fail_with_wrong_verifying_key() {
-        let mut rng = rand::rng();
+        let mut rng = SysRng.unwrap_err();
         let sk = SigningKey::<Shake128f>::new(&mut rng);
         let wrong_sk = SigningKey::<Shake128f>::new(&mut rng); // Generate a different signing key
         let msg = b"Hello, world!";
@@ -128,7 +127,7 @@ mod tests {
 
     #[test]
     fn test_sign_verify_fail_on_modified_signature() {
-        let mut rng = rand::rng();
+        let mut rng = SysRng.unwrap_err();
         let sk = SigningKey::<Shake128f>::new(&mut rng);
         let msg = b"Hello, world!";
 
@@ -148,7 +147,7 @@ mod tests {
 
     #[test]
     fn test_successive_signatures_not_equal() {
-        let mut rng = rand::rng();
+        let mut rng = SysRng.unwrap_err();
         let sk = SigningKey::<Shake128f>::new(&mut rng);
         let msg = b"Hello, world!";
 
@@ -163,7 +162,7 @@ mod tests {
 
     #[test]
     fn test_sign_verify_nonempty_context() {
-        let mut rng = rand::rng();
+        let mut rng = SysRng.unwrap_err();
         let sk = SigningKey::<Shake128f>::new(&mut rng);
         let vk = sk.verifying_key();
         let msg = b"Hello, world!";
@@ -174,7 +173,7 @@ mod tests {
 
     #[test]
     fn test_sign_verify_wrong_context() {
-        let mut rng = rand::rng();
+        let mut rng = SysRng.unwrap_err();
         let sk = SigningKey::<Shake128f>::new(&mut rng);
         let vk = sk.verifying_key();
         let msg = b"Hello, world!";

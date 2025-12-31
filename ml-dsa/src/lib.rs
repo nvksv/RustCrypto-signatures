@@ -4,7 +4,7 @@
     html_logo_url = "https://raw.githubusercontent.com/RustCrypto/meta/master/logo.svg",
     html_favicon_url = "https://raw.githubusercontent.com/RustCrypto/meta/master/logo.svg"
 )]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(clippy::pedantic)] // Be pedantic by default
 #![warn(clippy::integer_division_remainder_used)] // Be judicious about using `/` and `%`
 #![warn(clippy::as_conversions)] // Use proper conversions, not `as`
@@ -13,15 +13,20 @@
 #![allow(clippy::many_single_char_names)] // Allow notation matching the spec
 #![allow(clippy::clone_on_copy)] // Be explicit about moving data
 #![deny(missing_docs)] // Require all public interfaces to be documented
+#![warn(unreachable_pub)] // Prevent unexpected interface changes
 
 //! # Quickstart
 //!
 //! ```
 //! # #[cfg(feature = "rand_core")]
 //! # {
-//! use ml_dsa::{MlDsa65, KeyGen, signature::{Keypair, Signer, Verifier}};
+//! use ml_dsa::{
+//!     signature::{Keypair, Signer, Verifier},
+//!     MlDsa65, KeyGen,
+//! };
+//! use getrandom::rand_core::TryRngCore;
 //!
-//! let mut rng = rand::rng();
+//! let mut rng = getrandom::SysRng.unwrap_err();
 //! let kp = MlDsa65::key_gen(&mut rng);
 //!
 //! let msg = b"Hello world";
@@ -37,6 +42,7 @@ mod encode;
 mod hint;
 mod ntt;
 mod param;
+mod pkcs8;
 mod sampling;
 mod util;
 
@@ -51,32 +57,17 @@ use hybrid_array::{
         U75, U80, U88, Unsigned,
     },
 };
+use sha3::Shake256;
+use signature::{DigestSigner, DigestVerifier, MultipartSigner, MultipartVerifier, Signer};
 
 #[cfg(feature = "rand_core")]
-use rand_core::{CryptoRng, TryCryptoRng};
+use {
+    rand_core::{CryptoRng, TryCryptoRng},
+    signature::{RandomizedDigestSigner, RandomizedMultipartSigner, RandomizedSigner},
+};
 
 #[cfg(feature = "zeroize")]
 use zeroize::{Zeroize, ZeroizeOnDrop};
-
-#[cfg(feature = "pkcs8")]
-use {
-    const_oid::db::fips204,
-    pkcs8::{
-        AlgorithmIdentifierRef, PrivateKeyInfoRef,
-        der::{self, AnyRef},
-        spki::{
-            self, AlgorithmIdentifier, AssociatedAlgorithmIdentifier, SignatureAlgorithmIdentifier,
-            SubjectPublicKeyInfoRef,
-        },
-    },
-};
-
-#[cfg(all(feature = "alloc", feature = "pkcs8"))]
-use pkcs8::{
-    EncodePrivateKey, EncodePublicKey,
-    der::asn1::{BitString, BitStringRef, OctetStringRef},
-    spki::{SignatureBitStringEncoding, SubjectPublicKeyInfo},
-};
 
 use crate::algebra::{AlgebraExt, Elem, NttMatrix, NttVector, Truncate, Vector};
 use crate::crypto::H;
@@ -89,7 +80,11 @@ use core::fmt;
 
 pub use crate::param::{EncodedSignature, EncodedSigningKey, EncodedVerifyingKey, MlDsaParams};
 pub use crate::util::B32;
-pub use signature::{self, Error, MultipartSigner, MultipartVerifier};
+pub use signature::{self, Error};
+
+/// ML-DSA seeds are signing (private) keys, which are consistently 32-bytes across all security
+/// levels, and are the preferred serialization for representing such keys.
+pub type Seed = B32;
 
 /// An ML-DSA signature
 #[derive(Clone, PartialEq, Debug)]
@@ -147,35 +142,46 @@ impl<P: MlDsaParams> signature::SignatureEncoding for Signature<P> {
     type Repr = EncodedSignature<P>;
 }
 
-#[cfg(all(feature = "alloc", feature = "pkcs8"))]
-impl<P: MlDsaParams> SignatureBitStringEncoding for Signature<P> {
-    fn to_bitstring(&self) -> der::Result<BitString> {
-        BitString::new(0, self.encode().to_vec())
+struct MuBuilder(H);
+
+impl MuBuilder {
+    fn new(tr: &[u8], ctx: &[u8]) -> Self {
+        let mut h = H::default();
+        h = h.absorb(tr);
+        h = h.absorb(&[0]);
+        h = h.absorb(&[Truncate::truncate(ctx.len())]);
+        h = h.absorb(ctx);
+
+        Self(h)
+    }
+
+    fn internal(tr: &[u8], Mp: &[&[u8]]) -> B64 {
+        let mut h = H::default().absorb(tr);
+
+        for m in Mp {
+            h = h.absorb(m);
+        }
+
+        h.squeeze_new()
+    }
+
+    fn message(mut self, M: &[&[u8]]) -> B64 {
+        for m in M {
+            self.0 = self.0.absorb(m);
+        }
+
+        self.0.squeeze_new()
+    }
+
+    fn finish(mut self) -> B64 {
+        self.0.squeeze_new()
     }
 }
 
-#[cfg(feature = "pkcs8")]
-impl<P> AssociatedAlgorithmIdentifier for Signature<P>
-where
-    P: MlDsaParams,
-    P: AssociatedAlgorithmIdentifier<Params = AnyRef<'static>>,
-{
-    type Params = AnyRef<'static>;
-
-    const ALGORITHM_IDENTIFIER: AlgorithmIdentifierRef<'static> = P::ALGORITHM_IDENTIFIER;
-}
-
-// This method takes a slice of slices so that we can accommodate the varying calculations (direct
-// for test vectors, 0... for sign/sign_deterministic, 1... for the pre-hashed version) without
-// having to allocate memory for components.
-fn message_representative(tr: &[u8], Mp: &[&[&[u8]]]) -> B64 {
-    let mut h = H::default().absorb(tr);
-
-    for m in Mp.iter().copied().flatten() {
-        h = h.absorb(m);
+impl AsMut<Shake256> for MuBuilder {
+    fn as_mut(&mut self) -> &mut Shake256 {
+        self.0.updatable()
     }
-
-    h.squeeze_new()
 }
 
 /// An ML-DSA key pair
@@ -187,7 +193,6 @@ pub struct KeyPair<P: MlDsaParams> {
     verifying_key: VerifyingKey<P>,
 
     /// The seed this signing key was derived from
-    #[cfg(feature = "pkcs8")]
     seed: B32,
 }
 
@@ -200,6 +205,17 @@ impl<P: MlDsaParams> KeyPair<P> {
     /// The verifying key of the key pair
     pub fn verifying_key(&self) -> &VerifyingKey<P> {
         &self.verifying_key
+    }
+
+    /// Serialize the [`Seed`] value: 32-bytes which can be used to reconstruct the
+    /// [`KeyPair`].
+    ///
+    /// # ⚠️ Warning!
+    ///
+    /// This value is key material. Please treat it with care.
+    #[inline]
+    pub fn to_seed(&self) -> Seed {
+        self.seed
     }
 }
 
@@ -221,29 +237,9 @@ impl<P: MlDsaParams> signature::KeypairRef for KeyPair<P> {
     type VerifyingKey = VerifyingKey<P>;
 }
 
-#[cfg(feature = "pkcs8")]
-impl<P> TryFrom<PrivateKeyInfoRef<'_>> for KeyPair<P>
-where
-    P: MlDsaParams,
-    P: AssociatedAlgorithmIdentifier<Params = AnyRef<'static>>,
-{
-    type Error = pkcs8::Error;
-
-    fn try_from(private_key_info: pkcs8::PrivateKeyInfoRef<'_>) -> pkcs8::Result<Self> {
-        match private_key_info.algorithm {
-            alg if alg == P::ALGORITHM_IDENTIFIER => {}
-            other => return Err(spki::Error::OidUnknown { oid: other.oid }.into()),
-        }
-
-        let seed = Array::try_from(private_key_info.private_key.as_bytes())
-            .map_err(|_| pkcs8::Error::KeyMalformed)?;
-        Ok(P::key_gen_internal(&seed))
-    }
-}
-
 /// The `Signer` implementation for `KeyPair` uses the optional deterministic variant of ML-DSA, and
 /// only supports signing with an empty context string.
-impl<P: MlDsaParams> signature::Signer<Signature<P>> for KeyPair<P> {
+impl<P: MlDsaParams> Signer<Signature<P>> for KeyPair<P> {
     fn try_sign(&self, msg: &[u8]) -> Result<Signature<P>, Error> {
         self.try_multipart_sign(&[msg])
     }
@@ -257,30 +253,14 @@ impl<P: MlDsaParams> MultipartSigner<Signature<P>> for KeyPair<P> {
     }
 }
 
-#[cfg(feature = "pkcs8")]
-impl<P> SignatureAlgorithmIdentifier for KeyPair<P>
-where
-    P: MlDsaParams,
-    P: AssociatedAlgorithmIdentifier<Params = AnyRef<'static>>,
-{
-    type Params = AnyRef<'static>;
-
-    const SIGNATURE_ALGORITHM_IDENTIFIER: AlgorithmIdentifier<Self::Params> =
-        Signature::<P>::ALGORITHM_IDENTIFIER;
-}
-
-#[cfg(all(feature = "alloc", feature = "pkcs8"))]
-impl<P> EncodePrivateKey for KeyPair<P>
-where
-    P: MlDsaParams,
-    P: AssociatedAlgorithmIdentifier<Params = AnyRef<'static>>,
-{
-    fn to_pkcs8_der(&self) -> pkcs8::Result<der::SecretDocument> {
-        let pkcs8_key = pkcs8::PrivateKeyInfoRef::new(
-            P::ALGORITHM_IDENTIFIER,
-            OctetStringRef::new(&self.seed)?,
-        );
-        Ok(der::SecretDocument::encode_msg(&pkcs8_key)?)
+/// The `DigestSigner` implementation for `KeyPair` uses the optional deterministic variant of ML-DSA
+/// with a pre-computed μ, and only supports signing with an empty context string.
+impl<P: MlDsaParams> DigestSigner<Shake256, Signature<P>> for KeyPair<P> {
+    fn try_sign_digest<F: Fn(&mut Shake256) -> Result<(), Error>>(
+        &self,
+        f: F,
+    ) -> Result<Signature<P>, Error> {
+        self.signing_key.try_sign_digest(&f)
     }
 }
 
@@ -352,6 +332,16 @@ impl<P: MlDsaParams> SigningKey<P> {
         }
     }
 
+    /// Deterministically generate a signing key from the specified seed.
+    ///
+    /// This method reflects the ML-DSA.KeyGen_internal algorithm from FIPS 204, but only returns a
+    /// signing key.
+    #[must_use]
+    pub fn from_seed(seed: &Seed) -> Self {
+        let kp = P::from_seed(seed);
+        kp.signing_key
+    }
+
     /// This method reflects the ML-DSA.Sign_internal algorithm from FIPS 204. It does not
     /// include the domain separator that distinguishes between the normal and pre-hashed cases,
     /// and it does not separate the context string from the rest of the message.
@@ -361,24 +351,19 @@ impl<P: MlDsaParams> SigningKey<P> {
     where
         P: MlDsaParams,
     {
-        self.raw_sign_internal(&[Mp], rnd)
+        let mu = MuBuilder::internal(&self.tr, Mp);
+        self.raw_sign_mu(&mu, rnd)
     }
 
-    fn raw_sign_internal(&self, Mp: &[&[&[u8]]], rnd: &B32) -> Signature<P>
+    fn raw_sign_mu(&self, mu: &B64, rnd: &B32) -> Signature<P>
     where
         P: MlDsaParams,
     {
-        // Compute the message representative
-        // XXX(RLB): This line incorporates some of the logic from ML-DSA.sign to avoid computing
-        // the concatenated M'.
-        // XXX(RLB) Should the API represent this as an input?
-        let mu = message_representative(&self.tr, Mp);
-
         // Compute the private random seed
         let rhopp: B64 = H::default()
             .absorb(&self.K)
             .absorb(rnd)
-            .absorb(&mu)
+            .absorb(mu)
             .squeeze_new();
 
         // Rejection sampling loop
@@ -389,7 +374,7 @@ impl<P: MlDsaParams> SigningKey<P> {
 
             let w1_tilde = P::encode_w1(&w1);
             let c_tilde = H::default()
-                .absorb(&mu)
+                .absorb(mu)
                 .absorb(&w1_tilde)
                 .squeeze_new::<P::Lambda>();
             let c = sample_in_ball(&c_tilde, P::TAU);
@@ -437,6 +422,16 @@ impl<P: MlDsaParams> SigningKey<P> {
         ctx: &[u8],
         rng: &mut R,
     ) -> Result<Signature<P>, Error> {
+        self.raw_sign_randomized(&[M], ctx, rng)
+    }
+
+    #[cfg(feature = "rand_core")]
+    fn raw_sign_randomized<R: TryCryptoRng + ?Sized>(
+        &self,
+        Mp: &[&[u8]],
+        ctx: &[u8],
+        rng: &mut R,
+    ) -> Result<Signature<P>, Error> {
         if ctx.len() > 255 {
             return Err(Error::new());
         }
@@ -444,8 +439,26 @@ impl<P: MlDsaParams> SigningKey<P> {
         let mut rnd = B32::default();
         rng.try_fill_bytes(&mut rnd).map_err(|_| Error::new())?;
 
-        let Mp = &[&[0], &[Truncate::truncate(ctx.len())], ctx, M];
-        Ok(self.sign_internal(Mp, &rnd))
+        let mu = MuBuilder::new(&self.tr, ctx).message(Mp);
+        Ok(self.raw_sign_mu(&mu, &rnd))
+    }
+
+    /// This method reflects the randomized ML-DSA.Sign algorithm with a pre-computed μ.
+    ///
+    /// # Errors
+    ///
+    /// This method can return an opaque error if it fails to get enough randomness.
+    // Algorithm 2 ML-DSA.Sign (optional pre-computed μ variant)
+    #[cfg(feature = "rand_core")]
+    pub fn sign_mu_randomized<R: TryCryptoRng + ?Sized>(
+        &self,
+        mu: &B64,
+        rng: &mut R,
+    ) -> Result<Signature<P>, Error> {
+        let mut rnd = B32::default();
+        rng.try_fill_bytes(&mut rnd).map_err(|_| Error::new())?;
+
+        Ok(self.raw_sign_mu(mu, &rnd))
     }
 
     /// This method reflects the optional deterministic variant of the ML-DSA.Sign algorithm.
@@ -458,14 +471,21 @@ impl<P: MlDsaParams> SigningKey<P> {
         self.raw_sign_deterministic(&[M], ctx)
     }
 
-    fn raw_sign_deterministic(&self, M: &[&[u8]], ctx: &[u8]) -> Result<Signature<P>, Error> {
+    /// This method reflects the optional deterministic variant of the ML-DSA.Sign algorithm with a
+    /// pre-computed μ.
+    // Algorithm 2 ML-DSA.Sign (optional deterministic and pre-computed μ variant)
+    pub fn sign_mu_deterministic(&self, mu: &B64) -> Signature<P> {
+        let rnd = B32::default();
+        self.raw_sign_mu(mu, &rnd)
+    }
+
+    fn raw_sign_deterministic(&self, Mp: &[&[u8]], ctx: &[u8]) -> Result<Signature<P>, Error> {
         if ctx.len() > 255 {
             return Err(Error::new());
         }
 
-        let rnd = B32::default();
-        let Mp = &[&[&[0], &[Truncate::truncate(ctx.len())], ctx], M];
-        Ok(self.raw_sign_internal(Mp, &rnd))
+        let mu = MuBuilder::new(&self.tr, ctx).message(Mp);
+        Ok(self.sign_mu_deterministic(&mu))
     }
 
     /// Encode the key in a fixed-size byte array.
@@ -504,19 +524,36 @@ impl<P: MlDsaParams> SigningKey<P> {
             None,
         )
     }
+
+    /// This auxiliary function derives a `VerifyingKey` from a bare
+    /// `SigningKey` (even in the absence of the original seed).
+    ///
+    /// This is a utility function that is useful when importing the private key
+    /// from an external source which does not export the seed and does not
+    /// provide the precomputed public key associated with the private key
+    /// itself.
+    ///
+    /// `SigningKey` implements `signature::Keypair`: this inherent method is
+    /// retained for convenience, so it is available for callers even when the
+    /// `signature::Keypair` trait is out-of-scope.
+    pub fn verifying_key(&self) -> VerifyingKey<P> {
+        let kp: &dyn signature::Keypair<VerifyingKey = VerifyingKey<P>> = self;
+
+        kp.verifying_key()
+    }
 }
 
 /// The `Signer` implementation for `SigningKey` uses the optional deterministic variant of ML-DSA, and
 /// only supports signing with an empty context string.  If you would like to include a context
 /// string, use the [`SigningKey::sign_deterministic`] method.
-impl<P: MlDsaParams> signature::Signer<Signature<P>> for SigningKey<P> {
+impl<P: MlDsaParams> Signer<Signature<P>> for SigningKey<P> {
     fn try_sign(&self, msg: &[u8]) -> Result<Signature<P>, Error> {
         self.try_multipart_sign(&[msg])
     }
 }
 
 /// The `Signer` implementation for `SigningKey` uses the optional deterministic variant of ML-DSA, and
-/// only supports signing with an empty context string.  If you would like to include a context
+/// only supports signing with an empty context string. If you would like to include a context
 /// string, use the [`SigningKey::sign_deterministic`] method.
 impl<P: MlDsaParams> MultipartSigner<Signature<P>> for SigningKey<P> {
     fn try_multipart_sign(&self, msg: &[&[u8]]) -> Result<Signature<P>, Error> {
@@ -524,44 +561,88 @@ impl<P: MlDsaParams> MultipartSigner<Signature<P>> for SigningKey<P> {
     }
 }
 
+/// The `Signer` implementation for `SigningKey` uses the optional deterministic variant of ML-DSA
+/// with a pre-computed µ, and only supports signing with an empty context string. If you would
+/// like to include a context string, use the [`SigningKey::sign_mu_deterministic`] method.
+impl<P: MlDsaParams> DigestSigner<Shake256, Signature<P>> for SigningKey<P> {
+    fn try_sign_digest<F: Fn(&mut Shake256) -> Result<(), Error>>(
+        &self,
+        f: F,
+    ) -> Result<Signature<P>, Error> {
+        let mut mu = MuBuilder::new(&self.tr, &[]);
+        f(mu.as_mut())?;
+        let mu = mu.finish();
+
+        Ok(self.sign_mu_deterministic(&mu))
+    }
+}
+
+/// The `KeyPair` implementation for `SigningKey` allows to derive a `VerifyingKey` from
+/// a bare `SigningKey` (even in the absence of the original seed).
+impl<P: MlDsaParams> signature::Keypair for SigningKey<P> {
+    type VerifyingKey = VerifyingKey<P>;
+
+    /// This is a utility function that is useful when importing the private key
+    /// from an external source which does not export the seed and does not
+    /// provide the precomputed public key associated with the private key
+    /// itself.
+    fn verifying_key(&self) -> Self::VerifyingKey {
+        let As1 = &self.A_hat * &self.s1_hat;
+        let t = &As1.ntt_inverse() + &self.s2;
+
+        /* Discard t0 */
+        let (t1, _) = t.power2round();
+
+        VerifyingKey::new(self.rho.clone(), t1, Some(self.A_hat.clone()), None)
+    }
+}
+
 /// The `RandomizedSigner` implementation for `SigningKey` only supports signing with an empty
-/// context string. If you would like to include a context string, use the [`SigningKey::sign`]
-/// method.
+/// context string. If you would like to include a context string, use the
+/// [`SigningKey::sign_randomized`] method.
 #[cfg(feature = "rand_core")]
-impl<P: MlDsaParams> signature::RandomizedSigner<Signature<P>> for SigningKey<P> {
+impl<P: MlDsaParams> RandomizedSigner<Signature<P>> for SigningKey<P> {
     fn try_sign_with_rng<R: TryCryptoRng + ?Sized>(
         &self,
         rng: &mut R,
         msg: &[u8],
     ) -> Result<Signature<P>, Error> {
-        self.sign_randomized(msg, &[], rng)
+        self.try_multipart_sign_with_rng(rng, &[msg])
     }
 }
 
-#[cfg(feature = "pkcs8")]
-impl<P> SignatureAlgorithmIdentifier for SigningKey<P>
-where
-    P: MlDsaParams,
-    P: AssociatedAlgorithmIdentifier<Params = AnyRef<'static>>,
-{
-    type Params = AnyRef<'static>;
-
-    const SIGNATURE_ALGORITHM_IDENTIFIER: AlgorithmIdentifier<Self::Params> =
-        Signature::<P>::ALGORITHM_IDENTIFIER;
+/// The `RandomizedSigner` implementation for `SigningKey` only supports signing with an empty
+/// context string. If you would like to include a context string, use the
+/// [`SigningKey::sign_randomized`] method.
+#[cfg(feature = "rand_core")]
+impl<P: MlDsaParams> RandomizedMultipartSigner<Signature<P>> for SigningKey<P> {
+    fn try_multipart_sign_with_rng<R: TryCryptoRng + ?Sized>(
+        &self,
+        rng: &mut R,
+        msg: &[&[u8]],
+    ) -> Result<Signature<P>, Error> {
+        self.raw_sign_randomized(msg, &[], rng)
+    }
 }
 
-#[cfg(feature = "pkcs8")]
-impl<P> TryFrom<PrivateKeyInfoRef<'_>> for SigningKey<P>
-where
-    P: MlDsaParams,
-    P: AssociatedAlgorithmIdentifier<Params = AnyRef<'static>>,
-{
-    type Error = pkcs8::Error;
+/// The `RandomizedSigner` implementation for `SigningKey` only supports signing with an empty
+/// context string. If you would like to include a context string, use the
+/// [`SigningKey::sign_mu_randomized`] method.
+#[cfg(feature = "rand_core")]
+impl<P: MlDsaParams> RandomizedDigestSigner<Shake256, Signature<P>> for SigningKey<P> {
+    fn try_sign_digest_with_rng<
+        R: TryCryptoRng + ?Sized,
+        F: Fn(&mut Shake256) -> Result<(), Error>,
+    >(
+        &self,
+        rng: &mut R,
+        f: F,
+    ) -> Result<Signature<P>, Error> {
+        let mut mu = MuBuilder::new(&self.tr, &[]);
+        f(mu.as_mut())?;
+        let mu = mu.finish();
 
-    fn try_from(private_key_info: pkcs8::PrivateKeyInfoRef<'_>) -> pkcs8::Result<Self> {
-        let keypair = KeyPair::try_from(private_key_info)?;
-
-        Ok(keypair.signing_key)
+        self.sign_mu_randomized(&mu, rng)
     }
 }
 
@@ -599,24 +680,37 @@ impl<P: MlDsaParams> VerifyingKey<P> {
         }
     }
 
+    /// Computes µ according to FIPS 204 for use in ML-DSA.Sign and ML-DSA.Verify.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if the given `Mp` returns one.
+    pub fn compute_mu<F: FnOnce(&mut Shake256) -> Result<(), Error>>(
+        &self,
+        Mp: F,
+        ctx: &[u8],
+    ) -> Result<B64, Error> {
+        let mut mu = MuBuilder::new(&self.tr, ctx);
+        Mp(mu.as_mut())?;
+        Ok(mu.finish())
+    }
+
     /// This algorithm reflects the ML-DSA.Verify_internal algorithm from FIPS 204.  It does not
     /// include the domain separator that distinguishes between the normal and pre-hashed cases,
     /// and it does not separate the context string from the rest of the message.
     // Algorithm 8 ML-DSA.Verify_internal
-    pub fn verify_internal(&self, Mp: &[&[u8]], sigma: &Signature<P>) -> bool
+    pub fn verify_internal(&self, M: &[u8], sigma: &Signature<P>) -> bool
     where
         P: MlDsaParams,
     {
-        self.raw_verify_internal(&[Mp], sigma)
+        let mu = MuBuilder::internal(&self.tr, &[M]);
+        self.raw_verify_mu(&mu, sigma)
     }
 
-    fn raw_verify_internal(&self, Mp: &[&[&[u8]]], sigma: &Signature<P>) -> bool
+    fn raw_verify_mu(&self, mu: &B64, sigma: &Signature<P>) -> bool
     where
         P: MlDsaParams,
     {
-        // Compute the message representative
-        let mu = message_representative(&self.tr, Mp);
-
         // Reconstruct w
         let c = sample_in_ball(&sigma.c_tilde, P::TAU);
 
@@ -630,17 +724,23 @@ impl<P: MlDsaParams> VerifyingKey<P> {
 
         let w1p_tilde = P::encode_w1(&w1p);
         let cp_tilde = H::default()
-            .absorb(&mu)
+            .absorb(mu)
             .absorb(&w1p_tilde)
             .squeeze_new::<P::Lambda>();
 
         sigma.c_tilde == cp_tilde
     }
 
-    /// This algorithm reflect the ML-DSA.Verify algorithm from FIPS 204.
+    /// This algorithm reflects the ML-DSA.Verify algorithm from FIPS 204.
     // Algorithm 3 ML-DSA.Verify
     pub fn verify_with_context(&self, M: &[u8], ctx: &[u8], sigma: &Signature<P>) -> bool {
         self.raw_verify_with_context(&[M], ctx, sigma)
+    }
+
+    /// This algorithm reflects the ML-DSA.Verify algorithm with a pre-computed μ from FIPS 204.
+    // Algorithm 3 ML-DSA.Verify (optional pre-computed μ variant)
+    pub fn verify_mu(&self, mu: &B64, sigma: &Signature<P>) -> bool {
+        self.raw_verify_mu(mu, sigma)
     }
 
     fn raw_verify_with_context(&self, M: &[&[u8]], ctx: &[u8], sigma: &Signature<P>) -> bool {
@@ -648,8 +748,8 @@ impl<P: MlDsaParams> VerifyingKey<P> {
             return false;
         }
 
-        let Mp = &[&[&[0], &[Truncate::truncate(ctx.len())], ctx], M];
-        self.raw_verify_internal(Mp, sigma)
+        let mu = MuBuilder::new(&self.tr, ctx).message(M);
+        self.verify_mu(&mu, sigma)
     }
 
     fn encode_internal(rho: &B32, t1: &Vector<P::K>) -> EncodedVerifyingKey<P> {
@@ -686,58 +786,19 @@ impl<P: MlDsaParams> MultipartVerifier<Signature<P>> for VerifyingKey<P> {
     }
 }
 
-#[cfg(feature = "pkcs8")]
-impl<P> SignatureAlgorithmIdentifier for VerifyingKey<P>
-where
-    P: MlDsaParams,
-    P: AssociatedAlgorithmIdentifier<Params = AnyRef<'static>>,
-{
-    type Params = AnyRef<'static>;
+impl<P: MlDsaParams> DigestVerifier<Shake256, Signature<P>> for VerifyingKey<P> {
+    fn verify_digest<F: Fn(&mut Shake256) -> Result<(), Error>>(
+        &self,
+        f: F,
+        signature: &Signature<P>,
+    ) -> Result<(), Error> {
+        let mut mu = MuBuilder::new(&self.tr, &[]);
+        f(mu.as_mut())?;
+        let mu = mu.finish();
 
-    const SIGNATURE_ALGORITHM_IDENTIFIER: AlgorithmIdentifier<Self::Params> =
-        Signature::<P>::ALGORITHM_IDENTIFIER;
-}
-
-#[cfg(all(feature = "alloc", feature = "pkcs8"))]
-impl<P> EncodePublicKey for VerifyingKey<P>
-where
-    P: MlDsaParams,
-    P: AssociatedAlgorithmIdentifier<Params = AnyRef<'static>>,
-{
-    fn to_public_key_der(&self) -> spki::Result<der::Document> {
-        let public_key = self.encode();
-        let subject_public_key = BitStringRef::new(0, &public_key)?;
-
-        SubjectPublicKeyInfo {
-            algorithm: P::ALGORITHM_IDENTIFIER,
-            subject_public_key,
-        }
-        .try_into()
-    }
-}
-
-#[cfg(feature = "pkcs8")]
-impl<P> TryFrom<SubjectPublicKeyInfoRef<'_>> for VerifyingKey<P>
-where
-    P: MlDsaParams,
-    P: AssociatedAlgorithmIdentifier<Params = AnyRef<'static>>,
-{
-    type Error = spki::Error;
-
-    fn try_from(spki: SubjectPublicKeyInfoRef<'_>) -> spki::Result<Self> {
-        match spki.algorithm {
-            alg if alg == P::ALGORITHM_IDENTIFIER => {}
-            other => return Err(spki::Error::OidUnknown { oid: other.oid }),
-        }
-
-        Ok(Self::decode(
-            &EncodedVerifyingKey::<P>::try_from(
-                spki.subject_public_key
-                    .as_bytes()
-                    .ok_or_else(|| der::Tag::BitString.value_error().to_error())?,
-            )
-            .map_err(|_| pkcs8::Error::KeyMalformed)?,
-        ))
+        self.raw_verify_mu(&mu, signature)
+            .then_some(())
+            .ok_or(Error::new())
     }
 }
 
@@ -758,16 +819,6 @@ impl ParameterSet for MlDsa44 {
     const TAU: usize = 39;
 }
 
-#[cfg(feature = "pkcs8")]
-impl AssociatedAlgorithmIdentifier for MlDsa44 {
-    type Params = AnyRef<'static>;
-
-    const ALGORITHM_IDENTIFIER: AlgorithmIdentifierRef<'static> = AlgorithmIdentifierRef {
-        oid: fips204::ID_ML_DSA_44,
-        parameters: None,
-    };
-}
-
 /// `MlDsa65` is the parameter set for security category 3.
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct MlDsa65;
@@ -785,17 +836,7 @@ impl ParameterSet for MlDsa65 {
     const TAU: usize = 49;
 }
 
-#[cfg(feature = "pkcs8")]
-impl AssociatedAlgorithmIdentifier for MlDsa65 {
-    type Params = AnyRef<'static>;
-
-    const ALGORITHM_IDENTIFIER: AlgorithmIdentifierRef<'static> = AlgorithmIdentifierRef {
-        oid: fips204::ID_ML_DSA_65,
-        parameters: None,
-    };
-}
-
-/// `MlKem87` is the parameter set for security category 5.
+/// `MlDsa87` is the parameter set for security category 5.
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct MlDsa87;
 
@@ -812,16 +853,6 @@ impl ParameterSet for MlDsa87 {
     const TAU: usize = 60;
 }
 
-#[cfg(feature = "pkcs8")]
-impl AssociatedAlgorithmIdentifier for MlDsa87 {
-    type Params = AnyRef<'static>;
-
-    const ALGORITHM_IDENTIFIER: AlgorithmIdentifierRef<'static> = AlgorithmIdentifierRef {
-        oid: fips204::ID_ML_DSA_87,
-        parameters: None,
-    };
-}
-
 /// A parameter set that knows how to generate key pairs
 pub trait KeyGen: MlDsaParams {
     /// The type that is returned by key generation
@@ -832,8 +863,9 @@ pub trait KeyGen: MlDsaParams {
     fn key_gen<R: CryptoRng + ?Sized>(rng: &mut R) -> Self::KeyPair;
 
     /// Deterministically generate a signing key pair from the specified seed
-    // TODO(RLB): Only expose this based on a feature.
-    fn key_gen_internal(xi: &B32) -> Self::KeyPair;
+    ///
+    /// This method reflects the ML-DSA.KeyGen_internal algorithm from FIPS 204.
+    fn from_seed(xi: &B32) -> Self::KeyPair;
 }
 
 impl<P> KeyGen for P
@@ -848,12 +880,14 @@ where
     fn key_gen<R: CryptoRng + ?Sized>(rng: &mut R) -> KeyPair<P> {
         let mut xi = B32::default();
         rng.fill_bytes(&mut xi);
-        Self::key_gen_internal(&xi)
+        Self::from_seed(&xi)
     }
 
     /// Deterministically generate a signing key pair from the specified seed
+    ///
+    /// This method reflects the ML-DSA.KeyGen_internal algorithm from FIPS 204.
     // Algorithm 6 ML-DSA.KeyGen_internal
-    fn key_gen_internal(xi: &B32) -> KeyPair<P>
+    fn from_seed(xi: &Seed) -> KeyPair<P>
     where
         P: MlDsaParams,
     {
@@ -886,7 +920,6 @@ where
         KeyPair {
             signing_key,
             verifying_key,
-            #[cfg(feature = "pkcs8")]
             seed: xi.clone(),
         }
     }
@@ -896,6 +929,8 @@ where
 mod test {
     use super::*;
     use crate::param::*;
+    use getrandom::rand_core::{RngCore, TryRngCore};
+    use signature::digest::Update;
 
     #[test]
     fn output_sizes() {
@@ -920,7 +955,10 @@ mod test {
     where
         P: MlDsaParams + PartialEq,
     {
-        let kp = P::key_gen_internal(&Array::default());
+        let seed = Array::default();
+        let kp = P::from_seed(&seed);
+        assert_eq!(kp.to_seed(), seed);
+
         let sk = kp.signing_key;
         let vk = kp.verifying_key;
 
@@ -947,11 +985,30 @@ mod test {
         encode_decode_round_trip_test::<MlDsa87>();
     }
 
+    fn public_from_private_test<P>()
+    where
+        P: MlDsaParams + PartialEq,
+    {
+        let kp = P::from_seed(&Array::default());
+        let sk = kp.signing_key;
+        let vk = kp.verifying_key;
+        let vk_derived = sk.verifying_key();
+
+        assert!(vk == vk_derived);
+    }
+
+    #[test]
+    fn public_from_private() {
+        public_from_private_test::<MlDsa44>();
+        public_from_private_test::<MlDsa65>();
+        public_from_private_test::<MlDsa87>();
+    }
+
     fn sign_verify_round_trip_test<P>()
     where
         P: MlDsaParams,
     {
-        let kp = P::key_gen_internal(&Array::default());
+        let kp = P::from_seed(&Array::default());
         let sk = kp.signing_key;
         let vk = kp.verifying_key;
 
@@ -959,7 +1016,7 @@ mod test {
         let rnd = Array([0u8; 32]);
         let sig = sk.sign_internal(&[M], &rnd);
 
-        assert!(vk.verify_internal(&[M], &sig));
+        assert!(vk.verify_internal(M, &sig));
     }
 
     #[test]
@@ -973,18 +1030,16 @@ mod test {
     where
         P: MlDsaParams,
     {
-        use rand::Rng;
-
         const ITERATIONS: usize = 1000;
 
-        let mut rng = rand::rng();
+        let mut rng = getrandom::SysRng.unwrap_err();
         let mut seed = B32::default();
 
         for _i in 0..ITERATIONS {
             let seed_data: &mut [u8] = seed.as_mut();
-            rng.fill(seed_data);
+            rng.fill_bytes(seed_data);
 
-            let kp = P::key_gen_internal(&seed);
+            let kp = P::from_seed(&seed);
             let sk = kp.signing_key;
             let vk = kp.verifying_key;
 
@@ -996,7 +1051,7 @@ mod test {
             let sig_dec = Signature::<P>::decode(&sig_enc).unwrap();
 
             assert_eq!(sig_dec, sig);
-            assert!(vk.verify_internal(&[M], &sig_dec));
+            assert!(vk.verify_internal(M, &sig_dec));
         }
     }
 
@@ -1005,5 +1060,146 @@ mod test {
         many_round_trip_test::<MlDsa44>();
         many_round_trip_test::<MlDsa65>();
         many_round_trip_test::<MlDsa87>();
+    }
+
+    #[test]
+    fn sign_mu_verify_mu_round_trip() {
+        fn sign_mu_verify_mu<P>()
+        where
+            P: MlDsaParams,
+        {
+            let kp = P::from_seed(&Array::default());
+            let sk = kp.signing_key;
+            let vk = kp.verifying_key;
+
+            let M = b"Hello world";
+            let rnd = Array([0u8; 32]);
+            let mu = MuBuilder::internal(&sk.tr, &[M]);
+            let sig = sk.raw_sign_mu(&mu, &rnd);
+
+            assert!(vk.raw_verify_mu(&mu, &sig));
+        }
+        sign_mu_verify_mu::<MlDsa44>();
+        sign_mu_verify_mu::<MlDsa65>();
+        sign_mu_verify_mu::<MlDsa87>();
+    }
+
+    #[test]
+    fn sign_mu_verify_internal_round_trip() {
+        fn sign_mu_verify_internal<P>()
+        where
+            P: MlDsaParams,
+        {
+            let kp = P::from_seed(&Array::default());
+            let sk = kp.signing_key;
+            let vk = kp.verifying_key;
+
+            let M = b"Hello world";
+            let rnd = Array([0u8; 32]);
+            let mu = MuBuilder::internal(&sk.tr, &[M]);
+            let sig = sk.raw_sign_mu(&mu, &rnd);
+
+            assert!(vk.verify_internal(M, &sig));
+        }
+        sign_mu_verify_internal::<MlDsa44>();
+        sign_mu_verify_internal::<MlDsa65>();
+        sign_mu_verify_internal::<MlDsa87>();
+    }
+
+    #[test]
+    fn sign_internal_verify_mu_round_trip() {
+        fn sign_internal_verify_mu<P>()
+        where
+            P: MlDsaParams,
+        {
+            let kp = P::from_seed(&Array::default());
+            let sk = kp.signing_key;
+            let vk = kp.verifying_key;
+
+            let M = b"Hello world";
+            let rnd = Array([0u8; 32]);
+            let mu = MuBuilder::internal(&sk.tr, &[M]);
+            let sig = sk.sign_internal(&[M], &rnd);
+
+            assert!(vk.raw_verify_mu(&mu, &sig));
+        }
+        sign_internal_verify_mu::<MlDsa44>();
+        sign_internal_verify_mu::<MlDsa65>();
+        sign_internal_verify_mu::<MlDsa87>();
+    }
+
+    #[test]
+    fn sign_digest_round_trip() {
+        fn sign_digest<P>()
+        where
+            P: MlDsaParams,
+        {
+            let kp = P::from_seed(&Array::default());
+            let sk = kp.signing_key;
+            let vk = kp.verifying_key;
+
+            let M = b"Hello world";
+            let sig = sk.sign_digest(|digest| digest.update(M));
+            assert_eq!(sig, sk.sign(M));
+
+            vk.verify_digest(
+                |digest| {
+                    digest.update(M);
+                    Ok(())
+                },
+                &sig,
+            )
+            .unwrap();
+        }
+        sign_digest::<MlDsa44>();
+        sign_digest::<MlDsa65>();
+        sign_digest::<MlDsa87>();
+    }
+
+    #[test]
+    #[cfg(feature = "rand_core")]
+    fn sign_randomized_digest_round_trip() {
+        fn sign_digest<P>()
+        where
+            P: MlDsaParams,
+        {
+            let kp = P::from_seed(&Array::default());
+            let sk = kp.signing_key;
+            let vk = kp.verifying_key;
+
+            let M = b"Hello world";
+            let mut rng = getrandom::SysRng.unwrap_err();
+            let sig = sk.sign_digest_with_rng(&mut rng, |digest| digest.update(M));
+
+            vk.verify_digest(
+                |digest| {
+                    digest.update(M);
+                    Ok(())
+                },
+                &sig,
+            )
+            .unwrap();
+        }
+        sign_digest::<MlDsa44>();
+        sign_digest::<MlDsa65>();
+        sign_digest::<MlDsa87>();
+    }
+
+    #[test]
+    fn from_seed_implementations_match() {
+        fn assert_from_seed_equality<P>()
+        where
+            P: MlDsaParams,
+        {
+            let seed = Seed::default();
+            let kp1 = P::from_seed(&seed);
+            let sk1 = SigningKey::<P>::from_seed(&seed);
+            let vk1 = sk1.verifying_key();
+            assert_eq!(kp1.signing_key, sk1);
+            assert_eq!(kp1.verifying_key, vk1);
+        }
+        assert_from_seed_equality::<MlDsa44>();
+        assert_from_seed_equality::<MlDsa65>();
+        assert_from_seed_equality::<MlDsa87>();
     }
 }

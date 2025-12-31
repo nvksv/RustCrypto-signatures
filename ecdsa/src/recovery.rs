@@ -2,21 +2,13 @@
 
 use crate::{Error, Result};
 
-#[cfg(feature = "signing")]
+#[cfg(feature = "algorithm")]
 use {
-    crate::{SigningKey, hazmat::sign_prehashed_rfc6979},
-    elliptic_curve::{FieldBytes, subtle::CtOption},
-    signature::{
-        DigestSigner, MultipartSigner, RandomizedDigestSigner, Signer,
-        digest::FixedOutput,
-        hazmat::{PrehashSigner, RandomizedPrehashSigner},
-        rand_core::TryCryptoRng,
+    crate::{
+        EcdsaCurve, Signature, SignatureSize, SigningKey, VerifyingKey,
+        hazmat::{DigestAlgorithm, bits2field, sign_prehashed_rfc6979, verify_prehashed},
     },
-};
-
-#[cfg(feature = "verifying")]
-use {
-    crate::{VerifyingKey, hazmat::verify_prehashed},
+    digest::{Digest, block_api::EagerHash},
     elliptic_curve::{
         AffinePoint, FieldBytesEncoding, FieldBytesSize, Group, PrimeField, ProjectivePoint,
         bigint::CheckedAdd,
@@ -24,16 +16,14 @@ use {
         point::DecompressPoint,
         sec1::{self, FromEncodedPoint, ToEncodedPoint},
     },
-};
-
-#[cfg(any(feature = "signing", feature = "verifying"))]
-use {
-    crate::{
-        EcdsaCurve, Signature, SignatureSize,
-        hazmat::{DigestAlgorithm, bits2field},
+    elliptic_curve::{
+        CurveArithmetic, FieldBytes, Scalar, array::ArraySize, ops::Invert, subtle::CtOption,
     },
-    elliptic_curve::{CurveArithmetic, Scalar, array::ArraySize, ops::Invert},
-    signature::digest::Digest,
+    signature::{
+        DigestSigner, MultipartSigner, RandomizedDigestSigner, Signer,
+        hazmat::{PrehashSigner, RandomizedPrehashSigner},
+        rand_core::TryCryptoRng,
+    },
 };
 
 /// Recovery IDs, a.k.a. "recid".
@@ -89,7 +79,7 @@ impl RecoveryId {
     }
 }
 
-#[cfg(feature = "verifying")]
+#[cfg(feature = "algorithm")]
 impl RecoveryId {
     /// Given a public key, message, and signature, use trial recovery
     /// to determine if a suitable recovery ID exists, or return an error
@@ -118,7 +108,7 @@ impl RecoveryId {
     ) -> Result<Self>
     where
         C: EcdsaCurve + CurveArithmetic,
-        D: Digest,
+        D: EagerHash,
         AffinePoint<C>: DecompressPoint<C> + FromEncodedPoint<C> + ToEncodedPoint<C>,
         FieldBytesSize<C>: sec1::ModulusSize,
         SignatureSize<C>: ArraySize,
@@ -176,7 +166,7 @@ impl From<RecoveryId> for u8 {
     }
 }
 
-#[cfg(feature = "signing")]
+#[cfg(feature = "algorithm")]
 impl<C> SigningKey<C>
 where
     C: EcdsaCurve + CurveArithmetic + DigestAlgorithm,
@@ -213,7 +203,7 @@ where
     /// Sign the given message digest, returning a signature and recovery ID.
     pub fn sign_digest_recoverable<D>(&self, msg_digest: D) -> Result<(Signature<C>, RecoveryId)>
     where
-        D: Digest,
+        D: EagerHash,
     {
         self.sign_prehash_recoverable(&msg_digest.finalize())
     }
@@ -225,20 +215,25 @@ where
     }
 }
 
-#[cfg(feature = "signing")]
+#[cfg(feature = "algorithm")]
 impl<C, D> DigestSigner<D, (Signature<C>, RecoveryId)> for SigningKey<C>
 where
     C: EcdsaCurve + CurveArithmetic + DigestAlgorithm,
-    D: Digest,
+    D: EagerHash + digest::Update,
     Scalar<C>: Invert<Output = CtOption<Scalar<C>>>,
     SignatureSize<C>: ArraySize,
 {
-    fn try_sign_digest(&self, msg_digest: D) -> Result<(Signature<C>, RecoveryId)> {
-        self.sign_digest_recoverable(msg_digest)
+    fn try_sign_digest<F: Fn(&mut D) -> Result<()>>(
+        &self,
+        f: F,
+    ) -> Result<(Signature<C>, RecoveryId)> {
+        let mut digest = D::new();
+        f(&mut digest)?;
+        self.sign_digest_recoverable(digest)
     }
 }
 
-#[cfg(feature = "signing")]
+#[cfg(feature = "algorithm")]
 impl<C> RandomizedPrehashSigner<(Signature<C>, RecoveryId)> for SigningKey<C>
 where
     C: EcdsaCurve + CurveArithmetic + DigestAlgorithm,
@@ -254,24 +249,26 @@ where
     }
 }
 
-#[cfg(feature = "signing")]
+#[cfg(feature = "algorithm")]
 impl<C, D> RandomizedDigestSigner<D, (Signature<C>, RecoveryId)> for SigningKey<C>
 where
     C: EcdsaCurve + CurveArithmetic + DigestAlgorithm,
-    D: Digest + FixedOutput,
+    D: EagerHash + digest::Update,
     Scalar<C>: Invert<Output = CtOption<Scalar<C>>>,
     SignatureSize<C>: ArraySize,
 {
-    fn try_sign_digest_with_rng<R: TryCryptoRng + ?Sized>(
+    fn try_sign_digest_with_rng<R: TryCryptoRng + ?Sized, F: Fn(&mut D) -> Result<()>>(
         &self,
         rng: &mut R,
-        msg_digest: D,
+        f: F,
     ) -> Result<(Signature<C>, RecoveryId)> {
-        self.sign_prehash_with_rng(rng, &msg_digest.finalize_fixed())
+        let mut digest = D::new();
+        f(&mut digest)?;
+        self.sign_prehash_with_rng(rng, &digest.finalize())
     }
 }
 
-#[cfg(feature = "signing")]
+#[cfg(feature = "algorithm")]
 impl<C> PrehashSigner<(Signature<C>, RecoveryId)> for SigningKey<C>
 where
     C: EcdsaCurve + CurveArithmetic + DigestAlgorithm,
@@ -283,7 +280,7 @@ where
     }
 }
 
-#[cfg(feature = "signing")]
+#[cfg(feature = "algorithm")]
 impl<C> Signer<(Signature<C>, RecoveryId)> for SigningKey<C>
 where
     C: EcdsaCurve + CurveArithmetic + DigestAlgorithm,
@@ -295,7 +292,7 @@ where
     }
 }
 
-#[cfg(feature = "signing")]
+#[cfg(feature = "algorithm")]
 impl<C> MultipartSigner<(Signature<C>, RecoveryId)> for SigningKey<C>
 where
     C: EcdsaCurve + CurveArithmetic + DigestAlgorithm,
@@ -309,7 +306,7 @@ where
     }
 }
 
-#[cfg(feature = "verifying")]
+#[cfg(feature = "algorithm")]
 impl<C> VerifyingKey<C>
 where
     C: EcdsaCurve + CurveArithmetic,
@@ -340,7 +337,7 @@ where
         recovery_id: RecoveryId,
     ) -> Result<Self>
     where
-        D: Digest,
+        D: EagerHash,
     {
         Self::recover_from_prehash(&msg_digest.finalize(), signature, recovery_id)
     }
@@ -373,24 +370,23 @@ where
         recovery_id: RecoveryId,
     ) -> Result<Self> {
         let (r, s) = signature.split_scalars();
-        let z = <Scalar<C> as Reduce<C::Uint>>::reduce_bytes(&bits2field::<C>(prehash)?);
+        let z = Scalar::<C>::reduce(&bits2field::<C>(prehash)?);
 
         let r_bytes = if recovery_id.is_x_reduced() {
-            Option::<C::Uint>::from(
-                C::Uint::decode_field_bytes(&r.to_repr()).checked_add(&C::ORDER),
-            )
-            .ok_or_else(Error::new)?
-            .encode_field_bytes()
+            C::Uint::decode_field_bytes(&r.to_repr())
+                .checked_add(&C::ORDER)
+                .into_option()
+                .ok_or_else(Error::new)?
+                .encode_field_bytes()
         } else {
             r.to_repr()
         };
 
-        let R: ProjectivePoint<C> = Option::<AffinePoint<C>>::from(AffinePoint::<C>::decompress(
-            &r_bytes,
-            u8::from(recovery_id.is_y_odd()).into(),
-        ))
-        .ok_or_else(Error::new)?
-        .into();
+        let R: ProjectivePoint<C> =
+            AffinePoint::<C>::decompress(&r_bytes, u8::from(recovery_id.is_y_odd()).into())
+                .into_option()
+                .ok_or_else(Error::new)?
+                .into();
 
         let r_inv = *r.invert();
         let u1 = -(r_inv * z);

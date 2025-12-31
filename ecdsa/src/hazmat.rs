@@ -14,9 +14,12 @@ use crate::{EcdsaCurve, Error, Result};
 use core::cmp;
 use elliptic_curve::{FieldBytes, array::typenum::Unsigned};
 
-#[cfg(feature = "arithmetic")]
+#[cfg(feature = "algorithm")]
 use {
-    crate::{RecoveryId, SignatureSize},
+    crate::{
+        RecoveryId, Signature, SignatureSize,
+        elliptic_curve::{FieldBytesEncoding, array::ArraySize},
+    },
     elliptic_curve::{
         CurveArithmetic, NonZeroScalar, ProjectivePoint, Scalar,
         ff::PrimeField,
@@ -28,13 +31,7 @@ use {
 };
 
 #[cfg(feature = "digest")]
-use signature::digest::{Digest, FixedOutput, FixedOutputReset, block_api::BlockSizeUser};
-
-#[cfg(feature = "rfc6979")]
-use elliptic_curve::FieldBytesEncoding;
-
-#[cfg(any(feature = "arithmetic", feature = "rfc6979"))]
-use crate::{Signature, elliptic_curve::array::ArraySize};
+use digest::block_api::EagerHash;
 
 /// Bind a preferred [`Digest`] algorithm to an elliptic curve type.
 ///
@@ -44,7 +41,7 @@ use crate::{Signature, elliptic_curve::array::ArraySize};
 pub trait DigestAlgorithm: EcdsaCurve {
     /// Preferred digest to use when computing ECDSA signatures for this
     /// elliptic curve. This is typically a member of the SHA-2 family.
-    type Digest: BlockSizeUser + Digest + FixedOutput + FixedOutputReset;
+    type Digest: EagerHash + digest::Update;
 }
 
 /// Partial implementation of the `bits2int` function as defined in
@@ -102,7 +99,7 @@ pub fn bits2field<C: EcdsaCurve>(bits: &[u8]) -> Result<FieldBytes<C>> {
 ///
 /// This will return an error if a zero-scalar was generated. It can be tried again with a
 /// different `k`.
-#[cfg(feature = "arithmetic")]
+#[cfg(feature = "algorithm")]
 #[allow(non_snake_case)]
 pub fn sign_prehashed<C>(
     d: &NonZeroScalar<C>,
@@ -113,7 +110,7 @@ where
     C: EcdsaCurve + CurveArithmetic,
     SignatureSize<C>: ArraySize,
 {
-    let z = <Scalar<C> as Reduce<C::Uint>>::reduce_bytes(z);
+    let z = Scalar::<C>::reduce(z);
 
     // Compute scalar inversion of 𝑘.
     let k_inv = k.invert();
@@ -123,7 +120,7 @@ where
 
     // Lift x-coordinate of 𝑹 (element of base field) into a serialized big
     // integer, then reduce it into an element of the scalar field.
-    let r = Scalar::<C>::reduce_bytes(&R.x());
+    let r = Scalar::<C>::reduce(&R.x());
 
     // Compute 𝒔 as a signature over 𝒓 and 𝒛.
     let s = *k_inv * (z + (r * d.as_ref()));
@@ -159,7 +156,7 @@ where
 /// entropy `ad`.
 ///
 /// [RFC6979]: https://datatracker.ietf.org/doc/html/rfc6979
-#[cfg(feature = "rfc6979")]
+#[cfg(feature = "algorithm")]
 pub fn sign_prehashed_rfc6979<C, D>(
     d: &NonZeroScalar<C>,
     z: &FieldBytes<C>,
@@ -167,7 +164,7 @@ pub fn sign_prehashed_rfc6979<C, D>(
 ) -> Result<(Signature<C>, RecoveryId)>
 where
     C: EcdsaCurve + CurveArithmetic,
-    D: Digest + BlockSizeUser + FixedOutput + FixedOutputReset,
+    D: EagerHash,
     SignatureSize<C>: ArraySize,
 {
     // From RFC6979 § 2.4:
@@ -176,7 +173,7 @@ where
     // transform and an extra modular reduction:
     //
     // h = bits2int(H(m)) mod q
-    let z2 = <Scalar<C> as Reduce<C::Uint>>::reduce_bytes(z);
+    let z2 = Scalar::<C>::reduce(z);
 
     let k = NonZeroScalar::<C>::from_repr(rfc6979::generate_k::<D, _>(
         &d.to_repr(),
@@ -201,7 +198,7 @@ where
 /// # Low-S Normalization
 ///
 /// This is a low-level function that does *NOT* apply the `EcdsaCurve::NORMALIZE_S` checks.
-#[cfg(feature = "arithmetic")]
+#[cfg(feature = "algorithm")]
 pub fn verify_prehashed<C>(
     q: &ProjectivePoint<C>,
     z: &FieldBytes<C>,
@@ -211,7 +208,7 @@ where
     C: EcdsaCurve + CurveArithmetic,
     SignatureSize<C>: ArraySize,
 {
-    let z = Scalar::<C>::reduce_bytes(z);
+    let z = Scalar::<C>::reduce(z);
     let (r, s) = sig.split_scalars();
     let s_inv = *s.invert_vartime();
     let u1 = z * s_inv;
@@ -220,7 +217,7 @@ where
         .to_affine()
         .x();
 
-    if *r == Scalar::<C>::reduce_bytes(&x) {
+    if *r == Scalar::<C>::reduce(&x) {
         Ok(())
     } else {
         Err(Error::new())

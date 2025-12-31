@@ -5,6 +5,7 @@ use crate::{
     hazmat::{self, DigestAlgorithm, bits2field},
 };
 use core::{cmp::Ordering, fmt::Debug};
+use digest::{Update, block_api::EagerHash};
 use elliptic_curve::{
     AffinePoint, CurveArithmetic, FieldBytesSize, ProjectivePoint, PublicKey,
     array::ArraySize,
@@ -12,11 +13,7 @@ use elliptic_curve::{
     scalar::IsHigh,
     sec1::{self, CompressedPoint, EncodedPoint, FromEncodedPoint, ToEncodedPoint},
 };
-use signature::{
-    DigestVerifier, MultipartVerifier, Verifier,
-    digest::{Digest, FixedOutput},
-    hazmat::PrehashVerifier,
-};
+use signature::{DigestVerifier, MultipartVerifier, Verifier, hazmat::PrehashVerifier};
 
 #[cfg(feature = "alloc")]
 use alloc::boxed::Box;
@@ -108,7 +105,8 @@ where
 
     /// Initialize [`VerifyingKey`] from an [`EncodedPoint`].
     pub fn from_encoded_point(public_key: &EncodedPoint<C>) -> Result<Self> {
-        Option::from(PublicKey::<C>::from_encoded_point(public_key))
+        PublicKey::<C>::from_encoded_point(public_key)
+            .into_option()
             .map(|public_key| Self { inner: public_key })
             .ok_or_else(Error::new)
     }
@@ -146,11 +144,17 @@ where
 impl<C, D> DigestVerifier<D, Signature<C>> for VerifyingKey<C>
 where
     C: EcdsaCurve + CurveArithmetic,
-    D: Digest + FixedOutput,
+    D: EagerHash + Update,
     SignatureSize<C>: ArraySize,
 {
-    fn verify_digest(&self, msg_digest: D, signature: &Signature<C>) -> Result<()> {
-        self.verify_prehash(&msg_digest.finalize(), signature)
+    fn verify_digest<F: Fn(&mut D) -> Result<()>>(
+        &self,
+        f: F,
+        signature: &Signature<C>,
+    ) -> Result<()> {
+        let mut digest = D::new();
+        f(&mut digest)?;
+        self.verify_prehash(&digest.finalize(), signature)
     }
 }
 
@@ -188,9 +192,13 @@ where
     SignatureSize<C>: ArraySize,
 {
     fn multipart_verify(&self, msg: &[&[u8]], signature: &Signature<C>) -> Result<()> {
-        let mut digest = C::Digest::new();
-        msg.iter().for_each(|slice| digest.update(slice));
-        self.verify_digest(digest, signature)
+        self.verify_digest(
+            |digest: &mut C::Digest| {
+                msg.iter().for_each(|slice| digest.update(slice));
+                Ok(())
+            },
+            signature,
+        )
     }
 }
 
@@ -212,26 +220,28 @@ where
     SignatureSize<C>: ArraySize,
 {
     fn multipart_verify(&self, msg: &[&[u8]], sig: &SignatureWithOid<C>) -> Result<()> {
+        use digest::FixedOutput;
+
         match sig.oid() {
             ECDSA_SHA224_OID => {
-                let mut digest = Sha224::new();
+                let mut digest = Sha224::default();
                 msg.iter().for_each(|slice| digest.update(slice));
-                self.verify_prehash(&digest.finalize(), sig.signature())
+                self.verify_prehash(&digest.finalize_fixed(), sig.signature())
             }
             ECDSA_SHA256_OID => {
-                let mut digest = Sha256::new();
+                let mut digest = Sha256::default();
                 msg.iter().for_each(|slice| digest.update(slice));
-                self.verify_prehash(&digest.finalize(), sig.signature())
+                self.verify_prehash(&digest.finalize_fixed(), sig.signature())
             }
             ECDSA_SHA384_OID => {
-                let mut digest = Sha384::new();
+                let mut digest = Sha384::default();
                 msg.iter().for_each(|slice| digest.update(slice));
-                self.verify_prehash(&digest.finalize(), sig.signature())
+                self.verify_prehash(&digest.finalize_fixed(), sig.signature())
             }
             ECDSA_SHA512_OID => {
-                let mut digest = Sha512::new();
+                let mut digest = Sha512::default();
                 msg.iter().for_each(|slice| digest.update(slice));
-                self.verify_prehash(&digest.finalize(), sig.signature())
+                self.verify_prehash(&digest.finalize_fixed(), sig.signature())
             }
             _ => Err(Error::new()),
         }
@@ -242,14 +252,18 @@ where
 impl<C, D> DigestVerifier<D, der::Signature<C>> for VerifyingKey<C>
 where
     C: EcdsaCurve + CurveArithmetic,
-    D: Digest + FixedOutput,
+    D: EagerHash + Update,
     SignatureSize<C>: ArraySize,
     der::MaxSize<C>: ArraySize,
     <FieldBytesSize<C> as Add>::Output: Add<der::MaxOverhead> + ArraySize,
 {
-    fn verify_digest(&self, msg_digest: D, signature: &der::Signature<C>) -> Result<()> {
+    fn verify_digest<F: Fn(&mut D) -> Result<()>>(
+        &self,
+        f: F,
+        signature: &der::Signature<C>,
+    ) -> Result<()> {
         let signature = Signature::<C>::try_from(signature.clone())?;
-        DigestVerifier::<D, Signature<C>>::verify_digest(self, msg_digest, &signature)
+        DigestVerifier::<D, Signature<C>>::verify_digest(self, f, &signature)
     }
 }
 

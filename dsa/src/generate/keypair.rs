@@ -9,14 +9,14 @@ use signature::rand_core::CryptoRng;
 
 /// Generate a new keypair
 #[inline]
-pub fn keypair<R: CryptoRng + ?Sized>(rng: &mut R, components: Components) -> SigningKey {
+pub(crate) fn keypair<R: CryptoRng + ?Sized>(rng: &mut R, components: Components) -> SigningKey {
     #[inline]
     fn find_non_zero_x<R: CryptoRng + ?Sized>(
         rng: &mut R,
         components: &Components,
     ) -> NonZero<BoxedUint> {
         loop {
-            let x = BoxedUint::random_mod(rng, components.q());
+            let x = BoxedUint::random_mod_vartime(rng, components.q());
             if let Some(x) = NonZero::new(x).into() {
                 return x;
             }

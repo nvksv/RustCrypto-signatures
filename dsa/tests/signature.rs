@@ -1,12 +1,12 @@
 #![cfg(feature = "hazmat")]
 #![allow(deprecated)]
 
+use chacha20::{ChaCha8Rng, rand_core::SeedableRng};
 use digest::Digest;
 use dsa::{Components, KeySize, Signature, SigningKey};
+use getrandom::rand_core::CryptoRng;
 use hex_literal::hex;
 use pkcs8::der::{Decode, Encode};
-use rand::{CryptoRng, SeedableRng};
-use rand_chacha::ChaCha8Rng;
 use sha2::Sha256;
 use signature::{
     DigestVerifier, RandomizedDigestSigner, Signer, Verifier,
@@ -71,8 +71,10 @@ fn decode_encode_signature() {
 #[test]
 fn sign_message() {
     let signing_key = generate_deterministic_keypair();
-    let generated_signature =
-        signing_key.sign_digest_with_rng(&mut seeded_csprng(), Sha256::new().chain_update(MESSAGE));
+    let generated_signature = signing_key
+        .sign_digest_with_rng(&mut seeded_csprng(), |digest: &mut Sha256| {
+            digest.update(MESSAGE)
+        });
 
     let expected_signature =
         Signature::from_der(MESSAGE_SIGNATURE_CRATE_ASN1).expect("Failed to decode signature");
@@ -90,7 +92,13 @@ fn verify_signature() {
 
     assert!(
         verifying_key
-            .verify_digest(Sha256::new().chain_update(MESSAGE), &signature)
+            .verify_digest(
+                |digest: &mut Sha256| {
+                    digest.update(MESSAGE);
+                    Ok(())
+                },
+                &signature
+            )
             .is_ok()
     );
 }
@@ -160,6 +168,12 @@ fn verify_signature_precision() {
         let signature = Signature::from_der(&asn1)
             .expect("Failed to parse ASN.1 representation of the test signature");
 
-        let _ = verifying_key.verify_digest(Sha256::new().chain_update(MESSAGE), &signature);
+        let _ = verifying_key.verify_digest(
+            |digest: &mut Sha256| {
+                digest.update(MESSAGE);
+                Ok(())
+            },
+            &signature,
+        );
     }
 }

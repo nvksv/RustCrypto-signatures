@@ -18,6 +18,11 @@ env:
   CARGO_TERM_COLOR: always
   NEXTEST_NO_TESTS: warn
 
+# Cancels CI jobs when new commits are pushed to a PR branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   no_std:
     runs-on: ubuntu-latest
@@ -30,7 +35,7 @@ jobs:
           - 1.85.0 # MSRV
           - stable
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
@@ -53,7 +58,7 @@ jobs:
           - --all-features
           - default
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
@@ -68,7 +73,7 @@ jobs:
           fi
           cargo nextest archive --archive-file nextest-archive-${{ matrix.rust }}-${{ matrix.test_config }}.tar.zst $PROFILE
       - name: Upload archive to workflow
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: nextest-archive-${{ matrix.rust }}-${{ matrix.test_config }}
           # NOTE: upload-artifact does not respect the working directory, we need to prefix it.
@@ -94,11 +99,11 @@ jobs:
           - --all-features
           - "default"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - run: mkdir -p ~/.cargo/bin
       - uses: taiki-e/install-action@nextest
       - name: Download test archive
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: nextest-archive-${{ matrix.rust }}-${{ matrix.test_config }}
           path: slh-dsa

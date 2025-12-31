@@ -1,5 +1,5 @@
 #![no_std]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/RustCrypto/media/8f1a9894/logo.svg",
@@ -20,7 +20,8 @@
     missing_docs,
     rust_2018_idioms,
     unused_lifetimes,
-    unused_qualifications
+    unused_qualifications,
+    unreachable_pub
 )]
 
 //! ## `serde` support
@@ -65,9 +66,9 @@ pub mod der;
 pub mod dev;
 #[cfg(feature = "hazmat")]
 pub mod hazmat;
-#[cfg(feature = "signing")]
+#[cfg(feature = "algorithm")]
 mod signing;
-#[cfg(feature = "verifying")]
+#[cfg(feature = "algorithm")]
 mod verifying;
 
 pub use crate::recovery::RecoveryId;
@@ -79,21 +80,21 @@ pub use elliptic_curve::{self, PrimeCurve, sec1::EncodedPoint};
 pub use signature::{self, Error, Result, SignatureEncoding};
 use zeroize::Zeroize;
 
-#[cfg(feature = "signing")]
+#[cfg(feature = "algorithm")]
 pub use crate::signing::SigningKey;
-#[cfg(feature = "verifying")]
+#[cfg(feature = "algorithm")]
 pub use crate::verifying::VerifyingKey;
 
 use core::{fmt, ops::Add};
 use elliptic_curve::{
-    FieldBytes, FieldBytesSize, ScalarPrimitive,
+    FieldBytes, FieldBytesSize, ScalarValue,
     array::{Array, ArraySize, typenum::Unsigned},
 };
 
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
-#[cfg(feature = "arithmetic")]
+#[cfg(feature = "algorithm")]
 use {
     core::str,
     elliptic_curve::{
@@ -208,8 +209,8 @@ pub type SignatureBytes<C> = Array<u8, SignatureSize<C>>;
 /// [IEEE P1363]: https://en.wikipedia.org/wiki/IEEE_P1363
 #[derive(Clone, Eq, PartialEq)]
 pub struct Signature<C: EcdsaCurve> {
-    r: ScalarPrimitive<C>,
-    s: ScalarPrimitive<C>,
+    r: ScalarValue<C>,
+    s: ScalarValue<C>,
 }
 
 impl<C> Signature<C>
@@ -258,8 +259,8 @@ where
     /// - `Err(err)` if the `r` and/or `s` component of the signature is
     ///   out-of-range when interpreted as a big endian integer.
     pub fn from_scalars(r: impl Into<FieldBytes<C>>, s: impl Into<FieldBytes<C>>) -> Result<Self> {
-        let r = ScalarPrimitive::from_slice(&r.into()).map_err(|_| Error::new())?;
-        let s = ScalarPrimitive::from_slice(&s.into()).map_err(|_| Error::new())?;
+        let r = ScalarValue::from_slice(&r.into()).map_err(|_| Error::new())?;
+        let s = ScalarValue::from_slice(&s.into()).map_err(|_| Error::new())?;
 
         if r.is_zero().into() || s.is_zero().into() {
             return Err(Error::new());
@@ -300,7 +301,7 @@ where
     }
 }
 
-#[cfg(feature = "arithmetic")]
+#[cfg(feature = "algorithm")]
 impl<C> Signature<C>
 where
     C: EcdsaCurve + CurveArithmetic,
@@ -327,7 +328,7 @@ where
     /// [1]: https://github.com/bitcoin/bips/blob/master/bip-0062.mediawiki
     pub fn normalize_s(&self) -> Self {
         let mut result = self.clone();
-        let s_inv = ScalarPrimitive::from(-self.s());
+        let s_inv = ScalarValue::from(-self.s());
         result.s.conditional_assign(&s_inv, self.s.is_high());
         result
     }
@@ -423,7 +424,7 @@ where
     }
 }
 
-#[cfg(feature = "arithmetic")]
+#[cfg(feature = "algorithm")]
 impl<C> str::FromStr for Signature<C>
 where
     C: EcdsaCurve + CurveArithmetic,
@@ -524,8 +525,8 @@ where
 
 impl<C: EcdsaCurve> Zeroize for Signature<C> {
     fn zeroize(&mut self) {
-        self.r = ScalarPrimitive::ONE;
-        self.s = ScalarPrimitive::ONE;
+        self.r = ScalarValue::ONE;
+        self.s = ScalarValue::ONE;
     }
 }
 

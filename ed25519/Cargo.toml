@@ -1,6 +1,6 @@
 [package]
 name = "ed25519"
-version = "3.0.0-pre.0"
+version = "3.0.0-rc.2"
 authors = ["RustCrypto Developers"]
 license = "Apache-2.0 OR MIT"
 description = """
@@ -18,17 +18,15 @@ edition = "2024"
 rust-version = "1.85"
 
 [dependencies]
-# signature = { version = "3.0.0-rc.2", default-features = false }
-signature = { version = "3.0.0-rc.1", default-features = false, path = "../../traits/signature" }
+signature = { version = "3.0.0-rc.6", default-features = false, path = "../../traits/signature" }
 
 # optional dependencies
-pkcs8 = { version = "0.11.0-rc.6", optional = true }
+pkcs8 = { version = "0.11.0-rc.8", optional = true }
 serde = { version = "1", optional = true, default-features = false }
 serde_bytes = { version = "0.11", optional = true, default-features = false }
 zeroize = { version = "1", optional = true, default-features = false }
 
 [dev-dependencies]
-bincode = "1"
 #ed25519-dalek = { version = "2", features = ["rand_core"] }
 hex-literal = "1"
 #ring-compat = { version = "0.8", default-features = false, features = ["signature"] }
@@ -42,4 +40,3 @@ serde_bytes = ["serde", "dep:serde_bytes"]
 
 [package.metadata.docs.rs]
 all-features = true
-rustdoc-args = ["--cfg", "docsrs"]

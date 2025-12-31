@@ -1,6 +1,6 @@
 #![no_std]
 #![forbid(unsafe_code)]
-#![warn(missing_docs, rust_2018_idioms)]
+#![warn(missing_docs, rust_2018_idioms, unreachable_pub)]
 #![doc = include_str!("../README.md")]
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/RustCrypto/media/8f1a9894/logo.svg",
@@ -15,7 +15,9 @@
 #![cfg_attr(feature = "hazmat", doc = "```")]
 #![cfg_attr(not(feature = "hazmat"), doc = "```ignore")]
 //! # use dsa::{KeySize, Components, SigningKey};
-//! let mut csprng = rand::thread_rng();
+//! use getrandom::rand_core::TryRngCore;
+//!
+//! let mut csprng = getrandom::SysRng.unwrap_err();
 //! let components = Components::generate(&mut csprng, KeySize::DSA_2048_256);
 //! let signing_key = SigningKey::generate(&mut csprng, components);
 //! let verifying_key = signing_key.verifying_key();

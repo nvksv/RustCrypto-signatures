@@ -31,7 +31,7 @@ fn verify<P: MlDsaParams>(tc: &acvp::TestCase) {
     let vk_bytes = EncodedVerifyingKey::<P>::try_from(tc.pk.as_slice()).unwrap();
     let sk_bytes = EncodedSigningKey::<P>::try_from(tc.sk.as_slice()).unwrap();
 
-    let kp = P::key_gen_internal(&seed);
+    let kp = P::from_seed(&seed);
     let sk = kp.signing_key().clone();
     let vk = kp.verifying_key().clone();
 
@@ -48,24 +48,24 @@ mod acvp {
     use serde::{Deserialize, Serialize};
 
     #[derive(Deserialize, Serialize)]
-    pub struct TestVectorFile {
+    pub(crate) struct TestVectorFile {
         #[serde(rename = "testGroups")]
-        pub test_groups: Vec<TestGroup>,
+        pub(crate) test_groups: Vec<TestGroup>,
     }
 
     #[derive(Deserialize, Serialize)]
-    pub struct TestGroup {
+    pub(crate) struct TestGroup {
         #[serde(rename = "tgId")]
-        pub id: usize,
+        pub(crate) id: usize,
 
         #[serde(rename = "parameterSet")]
-        pub parameter_set: ParameterSet,
+        pub(crate) parameter_set: ParameterSet,
 
-        pub tests: Vec<TestCase>,
+        pub(crate) tests: Vec<TestCase>,
     }
 
     #[derive(Deserialize, Serialize)]
-    pub enum ParameterSet {
+    pub(crate) enum ParameterSet {
         #[serde(rename = "ML-DSA-44")]
         MlDsa44,
 
@@ -77,17 +77,17 @@ mod acvp {
     }
 
     #[derive(Deserialize, Serialize)]
-    pub struct TestCase {
+    pub(crate) struct TestCase {
         #[serde(rename = "tcId")]
-        pub id: usize,
+        pub(crate) id: usize,
 
         #[serde(with = "hex::serde")]
-        pub seed: Vec<u8>,
+        pub(crate) seed: Vec<u8>,
 
         #[serde(with = "hex::serde")]
-        pub pk: Vec<u8>,
+        pub(crate) pk: Vec<u8>,
 
         #[serde(with = "hex::serde")]
-        pub sk: Vec<u8>,
+        pub(crate) sk: Vec<u8>,
     }
 }
